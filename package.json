@@ -1,0 +1,18 @@
+{
+  "name": "slack-meet-bot",
+  "version": "1.0.0",
+  "description": "Slack app that creates and shares a Google Meet link via /meet command",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
