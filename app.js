@@ -3,130 +3,151 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const crypto = require("crypto");
+const { google } = require("googleapis");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Parse URL-encoded bodies (Slack sends slash commands as application/x-www-form-urlencoded)
-app.use(express.urlencoded({ extended: true }));
-
-// Raw body needed for signature verification
+// ── Middleware ────────────────────────────────────────────────────────────────
+app.use(
+  express.urlencoded({
+    extended: true,
+    verify: (req, _res, buf) => { req.rawBody = buf; },
+  })
+);
 app.use(
   express.json({
-    verify: (req, _res, buf) => {
-      req.rawBody = buf;
-    },
+    verify: (req, _res, buf) => { req.rawBody = buf; },
   })
 );
 
-// Middleware: verify the request actually came from Slack
+// ── Slack signature verification ──────────────────────────────────────────────
 function verifySlackSignature(req, res, next) {
-  const slackSigningSecret = process.env.SLACK_SIGNING_SECRET;
+  const secret = process.env.SLACK_SIGNING_SECRET;
+  if (!secret) return next();
 
-  if (!slackSigningSecret) {
-    console.warn("SLACK_SIGNING_SECRET not set — skipping signature check");
-    return next();
-  }
+  const sig = req.headers["x-slack-signature"];
+  const ts = req.headers["x-slack-request-timestamp"];
+  if (!sig || !ts) return res.status(400).send("Missing headers");
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300)
+    return res.status(400).send("Stale request");
 
-  const slackSignature = req.headers["x-slack-signature"];
-  const slackTimestamp = req.headers["x-slack-request-timestamp"];
-
-  if (!slackSignature || !slackTimestamp) {
-    return res.status(400).send("Missing Slack signature headers");
-  }
-
-  // Reject requests older than 5 minutes (replay attack protection)
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - parseInt(slackTimestamp, 10)) > 300) {
-    return res.status(400).send("Request timestamp too old");
-  }
-
-  const rawBody = req.rawBody
-    ? req.rawBody.toString("utf8")
-    : new URLSearchParams(req.body).toString();
-
-  const sigBase = `v0:${slackTimestamp}:${rawBody}`;
-  const mySignature =
+  const raw =
+    req.rawBody?.toString("utf8") ||
+    new URLSearchParams(req.body).toString();
+  const expected =
     "v0=" +
     crypto
-      .createHmac("sha256", slackSigningSecret)
-      .update(sigBase, "utf8")
+      .createHmac("sha256", secret)
+      .update(`v0:${ts}:${raw}`)
       .digest("hex");
 
-  if (
-    !crypto.timingSafeEqual(
-      Buffer.from(mySignature, "utf8"),
-      Buffer.from(slackSignature, "utf8")
-    )
-  ) {
-    return res.status(403).send("Invalid Slack signature");
-  }
+  if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig)))
+    return res.status(403).send("Invalid signature");
 
   next();
 }
 
-// Fetch the Google Meet link from the configured URL
-async function getGoogleMeetLink() {
-  const meetUrl = process.env.MEET_URL || "https://meet.google.com/getalink";
+// ── Token store (in-memory) ───────────────────────────────────────────────────
+// Tokens are stored per Slack user ID. They survive as long as the server runs.
+// Users only need to re-authenticate if the server restarts (rare on Koyeb).
+const tokenStore = new Map();
 
-  const response = await axios.get(meetUrl, {
-    maxRedirects: 10,
-    // If the endpoint redirects to the actual meet room URL, capture that final URL
-    validateStatus: (status) => status < 400,
-  });
-
-  // 1. If we were redirected to a meet.google.com room URL, use that
-  if (
-    response.request?.res?.responseUrl &&
-    response.request.res.responseUrl !== meetUrl
-  ) {
-    const finalUrl = response.request.res.responseUrl;
-    if (/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/.test(finalUrl)) {
-      return finalUrl;
-    }
-  }
-
-  // 2. Try to parse a meet link out of a JSON response body
-  if (typeof response.data === "object" && response.data !== null) {
-    const candidates = [
-      response.data.link,
-      response.data.url,
-      response.data.meetLink,
-      response.data.hangoutLink,
-    ];
-    for (const c of candidates) {
-      if (c && c.startsWith("https://meet.google.com/")) return c;
-    }
-  }
-
-  // 3. Try to extract a meet link from an HTML/text response
-  if (typeof response.data === "string") {
-    const match = response.data.match(
-      /https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/
-    );
-    if (match) return match[0];
-  }
-
-  throw new Error(
-    `Could not extract a Google Meet link from the response. Raw response: ${JSON.stringify(response.data).slice(0, 300)}`
+// ── OAuth2 client factory ─────────────────────────────────────────────────────
+function makeOAuth2Client() {
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI
   );
 }
 
-// POST /meet — Slack slash command endpoint
-app.post("/meet", verifySlackSignature, async (req, res) => {
-  const { user_name, channel_name, channel_id } = req.body;
+// ── Build the Google auth URL, encoding Slack context in state ────────────────
+function getAuthUrl(slackUserId, responseUrl) {
+  const oauth2 = makeOAuth2Client();
+  const state = Buffer.from(
+    JSON.stringify({ slackUserId, responseUrl })
+  ).toString("base64url");
 
-  // Immediately acknowledge to Slack (must respond within 3 seconds)
-  res.status(200).json({
-    response_type: "in_channel",
-    text: `_Generating a Google Meet link..._`,
+  return oauth2.generateAuthUrl({
+    access_type: "offline",
+    scope: ["https://www.googleapis.com/auth/calendar.events"],
+    state,
+    prompt: "consent",
+  });
+}
+
+// ── Create a Meet link via Calendar API, then delete the placeholder event ────
+async function createMeetLink(userId) {
+  const tokens = tokenStore.get(userId);
+  if (!tokens) throw new Error("NOT_AUTHENTICATED");
+
+  const oauth2 = makeOAuth2Client();
+  oauth2.setCredentials(tokens);
+
+  // Persist refreshed tokens automatically
+  oauth2.on("tokens", (refreshed) => {
+    tokenStore.set(userId, { ...tokens, ...refreshed });
   });
 
-  // Fetch the meet link asynchronously and send a follow-up message
-  try {
-    const meetLink = await getGoogleMeetLink();
+  const calendar = google.calendar({ version: "v3", auth: oauth2 });
 
-    await axios.post(req.body.response_url, {
+  const now = new Date();
+  const later = new Date(now.getTime() + 3600000);
+
+  const { data: event } = await calendar.events.insert({
+    calendarId: "primary",
+    conferenceDataVersion: 1,
+    resource: {
+      summary: "Meeting",
+      start: { dateTime: now.toISOString() },
+      end: { dateTime: later.toISOString() },
+      conferenceData: {
+        createRequest: {
+          requestId: `meet-${Date.now()}`,
+          conferenceSolutionKey: { type: "hangoutsMeet" },
+        },
+      },
+    },
+  });
+
+  const meetLink = event.conferenceData?.entryPoints?.find(
+    (e) => e.entryPointType === "video"
+  )?.uri;
+
+  if (!meetLink) throw new Error("Google did not return a Meet link");
+
+  // Clean up — delete the placeholder event immediately
+  await calendar.events
+    .delete({ calendarId: "primary", eventId: event.id })
+    .catch(() => {});
+
+  return meetLink;
+}
+
+// ── POST /meet — Slack slash command ─────────────────────────────────────────
+app.post("/meet", verifySlackSignature, async (req, res) => {
+  const { user_id, user_name, response_url } = req.body;
+
+  // If user hasn't connected Google yet, send them the auth link privately
+  if (!tokenStore.has(user_id)) {
+    const authUrl = getAuthUrl(user_id, response_url);
+    return res.json({
+      response_type: "ephemeral",
+      text: `:wave: Before using \`/meet\`, connect your Google account (one-time):\n<${authUrl}|*Click here to connect Google*>`,
+    });
+  }
+
+  // Acknowledge immediately (Slack requires a response within 3 s)
+  res.json({
+    response_type: "in_channel",
+    text: "_Creating Google Meet link..._",
+  });
+
+  try {
+    const meetLink = await createMeetLink(user_id);
+
+    await axios.post(response_url, {
       response_type: "in_channel",
       replace_original: true,
       blocks: [
@@ -134,7 +155,7 @@ app.post("/meet", verifySlackSignature, async (req, res) => {
           type: "section",
           text: {
             type: "mrkdwn",
-            text: `:video_camera: *Google Meet link created by <@${user_name || "someone"}>*\n<${meetLink}|Join the meeting>`,
+            text: `:video_camera: *Google Meet started by <@${user_name || user_id}>*\n<${meetLink}|Join the meeting>`,
           },
           accessory: {
             type: "button",
@@ -146,21 +167,69 @@ app.post("/meet", verifySlackSignature, async (req, res) => {
       ],
     });
   } catch (err) {
-    console.error("Error fetching meet link:", err.message);
-
-    await axios
-      .post(req.body.response_url, {
-        response_type: "ephemeral",
-        replace_original: true,
-        text: `:x: Sorry, I couldn't generate a Google Meet link. Please try again.\n\`${err.message}\``,
-      })
-      .catch(console.error);
+    if (err.message === "NOT_AUTHENTICATED") {
+      const authUrl = getAuthUrl(user_id, response_url);
+      await axios
+        .post(response_url, {
+          response_type: "ephemeral",
+          replace_original: true,
+          text: `:wave: Your Google session expired. Reconnect here:\n<${authUrl}|*Reconnect Google*>`,
+        })
+        .catch(() => {});
+    } else {
+      console.error("Meet link error:", err.message);
+      await axios
+        .post(response_url, {
+          response_type: "ephemeral",
+          replace_original: true,
+          text: `:x: Couldn't create Meet link: ${err.message}`,
+        })
+        .catch(() => {});
+    }
   }
 });
 
-// Health check
+// ── GET /auth/google/callback — OAuth redirect handler ───────────────────────
+app.get("/auth/google/callback", async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.send(
+      `<h2 style="font-family:sans-serif">Auth cancelled: ${error}</h2><p>Close this tab and try again.</p>`
+    );
+  }
+
+  try {
+    const { slackUserId, responseUrl } = JSON.parse(
+      Buffer.from(state, "base64url").toString()
+    );
+
+    const oauth2 = makeOAuth2Client();
+    const { tokens } = await oauth2.getToken(code);
+    tokenStore.set(slackUserId, tokens);
+
+    // Notify the user in Slack that they're connected
+    await axios
+      .post(responseUrl, {
+        response_type: "ephemeral",
+        text: ":white_check_mark: Google account connected! Type `/meet` to create a meeting link.",
+      })
+      .catch(() => {});
+
+    res.send(`
+      <html><body style="font-family:sans-serif;text-align:center;padding:60px;color:#333">
+        <h2>✅ Google account connected!</h2>
+        <p>You can close this tab and go back to Slack.</p>
+        <p>Type <strong>/meet</strong> to get your meeting link.</p>
+      </body></html>
+    `);
+  } catch (err) {
+    console.error("OAuth callback error:", err.message);
+    res.status(500).send(`<h2>Error: ${err.message}</h2><p>Close this tab and try again.</p>`);
+  }
+});
+
+// ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
-app.listen(PORT, () => {
-  console.log(`Slack Meet Bot listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Slack Meet Bot listening on port ${PORT}`));
