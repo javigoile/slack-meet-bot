@@ -4,8 +4,13 @@ const express = require("express");
 const axios = require("axios");
 const crypto = require("crypto");
 const { google } = require("googleapis");
+const { Redis } = require("@upstash/redis");
 
 const app = express();
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 const PORT = process.env.PORT || 3000;
 
 // ── Middleware ────────────────────────────────────────────────────────────────
@@ -48,11 +53,6 @@ function verifySlackSignature(req, res, next) {
   next();
 }
 
-// ── Token store (in-memory) ───────────────────────────────────────────────────
-// Tokens are stored per Slack user ID. They survive as long as the server runs.
-// Users only need to re-authenticate if the server restarts (rare on Koyeb).
-const tokenStore = new Map();
-
 // ── OAuth2 client factory ─────────────────────────────────────────────────────
 function makeOAuth2Client() {
   return new google.auth.OAuth2(
@@ -79,7 +79,7 @@ function getAuthUrl(slackUserId, responseUrl) {
 
 // ── Create a Meet link via Calendar API, then delete the placeholder event ────
 async function createMeetLink(userId) {
-  const tokens = tokenStore.get(userId);
+  const tokens = await redis.get(userId);
   if (!tokens) throw new Error("NOT_AUTHENTICATED");
 
   const oauth2 = makeOAuth2Client();
@@ -87,7 +87,7 @@ async function createMeetLink(userId) {
 
   // Persist refreshed tokens automatically
   oauth2.on("tokens", (refreshed) => {
-    tokenStore.set(userId, { ...tokens, ...refreshed });
+    redis.set(userId, { ...tokens, ...refreshed }).catch(() => {});
   });
 
   const calendar = google.calendar({ version: "v3", auth: oauth2 });
@@ -130,7 +130,7 @@ app.post("/meet", verifySlackSignature, async (req, res) => {
   const { user_id, user_name, response_url } = req.body;
 
   // If user hasn't connected Google yet, send them the auth link privately
-  if (!tokenStore.has(user_id)) {
+  if (!(await redis.get(user_id))) {
     const authUrl = getAuthUrl(user_id, response_url);
     return res.json({
       response_type: "ephemeral",
@@ -206,7 +206,7 @@ app.get("/auth/google/callback", async (req, res) => {
 
     const oauth2 = makeOAuth2Client();
     const { tokens } = await oauth2.getToken(code);
-    tokenStore.set(slackUserId, tokens);
+    await redis.set(slackUserId, tokens);
 
     // Notify the user in Slack that they're connected
     await axios
